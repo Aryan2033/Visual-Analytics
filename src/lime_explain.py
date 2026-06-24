@@ -34,12 +34,12 @@ from predict import CLASS_NAMES, get_model
 
 # LIME calls our model many times, so we need a "batch predict" function
 # that takes a numpy batch of images and returns class probabilities.
-def _batch_predict(images_np: np.ndarray) -> np.ndarray:
+def _batch_predict(images_np: np.ndarray, model_type: str = "resnet50") -> np.ndarray:
     """
     images_np: (N, H, W, 3) uint8 or float [0..1] numpy array
     returns:   (N, num_classes) numpy array of probabilities
     """
-    model = get_model()
+    model = get_model(model_type)
 
     # Convert to a torch tensor of shape (N, 3, H, W) and normalize the same
     # way our training transforms did, otherwise the model gets confused.
@@ -57,7 +57,7 @@ def _batch_predict(images_np: np.ndarray) -> np.ndarray:
     return probs.cpu().numpy()
 
 
-def compute_lime(image_path: Path, num_samples: int = 1000, num_features: int = 5) -> Tuple[np.ndarray, np.ndarray, str, float]:
+def compute_lime(image_path: Path, num_samples: int = 1000, num_features: int = 5, model_type: str = "resnet50") -> Tuple[np.ndarray, np.ndarray, str, float]:
     """
     Returns:
         explanation_mask: (224, 224) int array, nonzero where LIME found important superpixels
@@ -69,7 +69,7 @@ def compute_lime(image_path: Path, num_samples: int = 1000, num_features: int = 
     image_np  = np.array(pil_image)
 
     # Predict once to get the label that LIME should explain
-    probs = _batch_predict(image_np[np.newaxis])[0]
+    probs = _batch_predict(image_np[np.newaxis], model_type=model_type)[0]
     pred_idx = int(np.argmax(probs))
     confidence = float(probs[pred_idx])
 
@@ -77,7 +77,7 @@ def compute_lime(image_path: Path, num_samples: int = 1000, num_features: int = 
     explainer = LimeImageExplainer()
     explanation = explainer.explain_instance(
         image=image_np,
-        classifier_fn=_batch_predict,
+        classifier_fn=lambda imgs: _batch_predict(imgs, model_type=model_type),
         top_labels=2,
         hide_color=0,          # hide superpixels by painting them black
         num_samples=num_samples,
@@ -106,11 +106,24 @@ if __name__ == "__main__":
         sys.exit(1)
 
     img_path = Path(sys.argv[1])
-    print("Running LIME (this takes ~10-30 seconds, it queries the model 1000 times)...")
-    mask, overlay, label, conf = compute_lime(img_path)
+    
+    print("Running LIME for ResNet-50 (takes ~10-30 seconds)...")
+    try:
+        mask, overlay, label, conf = compute_lime(img_path, model_type="resnet50")
+        out_path = Path("lime_output.png")
+        Image.fromarray(overlay).save(out_path)
+        print(f"  Prediction: {label} ({conf:.3f})")
+        print(f"  Saved overlay -> {out_path.resolve()}")
+    except Exception as e:
+        print(f"  Error: {e}")
 
-    out_path = Path("lime_output.png")
-    Image.fromarray(overlay).save(out_path)
-    print(f"Prediction: {label}  ({conf:.3f})")
-    print(f"Important superpixels: {int(mask.sum() > 0)} regions highlighted")
-    print(f"Saved overlay -> {out_path.resolve()}")
+    print("\nRunning LIME for Custom 2D CNN (takes ~10-30 seconds)...")
+    try:
+        mask_cnn, overlay_cnn, label_cnn, conf_cnn = compute_lime(img_path, model_type="cnn")
+        out_path_cnn = Path("lime_output_cnn.png")
+        Image.fromarray(overlay_cnn).save(out_path_cnn)
+        print(f"  Prediction: {label_cnn} ({conf_cnn:.3f})")
+        print(f"  Saved overlay -> {out_path_cnn.resolve()}")
+    except Exception as e:
+        print(f"  Error: {e}")
+

@@ -25,22 +25,30 @@ CLASS_NAMES = ["normal", "anomalous"]
 
 
 # A simple module-level cache so we do not reload the model on every call
-# (loading ResNet-50 from disk takes ~1 second on M4).
-_MODEL = None
+_MODELS = {}
 _TRANSFORM = None
 
 
-def get_model():
-    global _MODEL
-    if _MODEL is None:
-        ckpt = CHECKPOINTS_DIR / "best_model.pt"
-        if not ckpt.exists():
-            raise FileNotFoundError(
-                f"No checkpoint at {ckpt}.  "
-                f"Train the model first with: python src/train.py"
-            )
-        _MODEL = load_checkpoint(ckpt, DEVICE)
-    return _MODEL
+def get_model(model_type: str = "resnet50"):
+    global _MODELS
+    if model_type not in _MODELS:
+        if model_type == "cnn":
+            ckpt = CHECKPOINTS_DIR / "best_model_cnn.pt"
+            if not ckpt.exists():
+                raise FileNotFoundError(
+                    f"No checkpoint at {ckpt}.  "
+                    f"Train the CNN model first with: python src/train_cnn.py"
+                )
+            _MODELS[model_type] = load_checkpoint(ckpt, DEVICE, model_type="cnn")
+        else:
+            ckpt = CHECKPOINTS_DIR / "best_model.pt"
+            if not ckpt.exists():
+                raise FileNotFoundError(
+                    f"No checkpoint at {ckpt}.  "
+                    f"Train the ResNet model first with: python src/train.py"
+                )
+            _MODELS[model_type] = load_checkpoint(ckpt, DEVICE, model_type="resnet50")
+    return _MODELS[model_type]
 
 
 def get_transform():
@@ -50,14 +58,14 @@ def get_transform():
     return _TRANSFORM
 
 
-def predict_image(image_path: Path) -> Tuple[str, float]:
+def predict_image(image_path: Path, model_type: str = "resnet50") -> Tuple[str, float]:
     """
     Returns (predicted_class_name, confidence_in_that_class).
     """
     image = Image.open(image_path).convert("RGB")
     tensor = get_transform()(image).unsqueeze(0).to(DEVICE)
 
-    model = get_model()
+    model = get_model(model_type)
     with torch.no_grad():
         logits = model(tensor)
         probs  = F.softmax(logits, dim=1)[0]
@@ -73,5 +81,18 @@ if __name__ == "__main__":
         sys.exit(1)
 
     path = Path(sys.argv[1])
-    label, conf = predict_image(path)
-    print(f"{path.name}  ->  {label}  ({conf:.3f})")
+    
+    print("ResNet-50:")
+    try:
+        label, conf = predict_image(path, model_type="resnet50")
+        print(f"  {path.name}  ->  {label}  ({conf:.3f})")
+    except Exception as e:
+        print(f"  Error: {e}")
+
+    print("\nCustom 2D CNN:")
+    try:
+        label, conf = predict_image(path, model_type="cnn")
+        print(f"  {path.name}  ->  {label}  ({conf:.3f})")
+    except Exception as e:
+        print(f"  Error: {e}")
+

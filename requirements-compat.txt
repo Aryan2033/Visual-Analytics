@@ -1,0 +1,22 @@
+# Compatibility-adjusted requirements for Python 3.13
+# Replaces torch==2.3.1 (no wheel) with a wheel-available release for py3.13
+torch==2.12.0
+torchvision==0.27.0
+numpy==2.4.6
+pillow==12.2.0
+matplotlib==3.8.4
+scikit-learn==1.4.2
+scikit-image==0.23.2
+opencv-python==4.9.0.80
+tqdm==4.66.4
+
+# XAI libraries
+grad-cam==1.5.0
+lime==0.2.0.1
+
+# Dashboard (used in Stage 5)
+streamlit==1.35.0
+
+# Notebook (for data exploration)
+jupyter==1.0.0
+ipykernel==6.29.4

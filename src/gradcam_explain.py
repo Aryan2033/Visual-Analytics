@@ -31,7 +31,7 @@ from dataset import build_eval_transform
 from predict import CLASS_NAMES, get_model
 
 
-def compute_gradcam(image_path: Path, target_class: int = None) -> Tuple[np.ndarray, np.ndarray, str, float]:
+def compute_gradcam(image_path: Path, target_class: int = None, model_type: str = "resnet50") -> Tuple[np.ndarray, np.ndarray, str, float]:
     """
     Returns:
         heatmap:        (224, 224) float array, values in [0, 1]
@@ -45,7 +45,7 @@ def compute_gradcam(image_path: Path, target_class: int = None) -> Tuple[np.ndar
     tensor    = build_eval_transform()(Image.open(image_path).convert("RGB")).unsqueeze(0).to(DEVICE)
 
     # Predict
-    model = get_model()
+    model = get_model(model_type)
     with torch.no_grad():
         logits = model(tensor)
         probs  = torch.softmax(logits, dim=1)[0]
@@ -53,10 +53,12 @@ def compute_gradcam(image_path: Path, target_class: int = None) -> Tuple[np.ndar
         confidence = float(probs[pred_idx].item())
 
     # Grad-CAM
-    # For ResNet-50, layer4 is the last convolutional block.  This is the
-    # standard target.  Grad-CAM will produce a 7x7 attribution map there
-    # and upscale it to 224x224 for us.
-    target_layers = [model.layer4[-1]]
+    # Target layers dynamically based on model type
+    if model_type == "cnn":
+        target_layers = [model.layer4[0]]  # Conv2d of last block
+    else:
+        target_layers = [model.layer4[-1]]  # last residual layer of ResNet-50
+        
     targets = [ClassifierOutputTarget(target_class if target_class is not None else pred_idx)]
 
     # The library handles enabling gradients internally.  We use a `with`
@@ -74,10 +76,24 @@ if __name__ == "__main__":
         sys.exit(1)
 
     img_path = Path(sys.argv[1])
-    heatmap, overlay, label, conf = compute_gradcam(img_path)
+    
+    print("Computing Grad-CAM for ResNet-50...")
+    try:
+        heatmap, overlay, label, conf = compute_gradcam(img_path, model_type="resnet50")
+        out_path = Path("gradcam_output.png")
+        Image.fromarray(overlay).save(out_path)
+        print(f"  Prediction: {label} ({conf:.3f})")
+        print(f"  Saved overlay -> {out_path.resolve()}")
+    except Exception as e:
+        print(f"  Error: {e}")
 
-    out_path = Path("gradcam_output.png")
-    Image.fromarray(overlay).save(out_path)
-    print(f"Prediction: {label}  ({conf:.3f})")
-    print(f"Heatmap shape: {heatmap.shape}  range: [{heatmap.min():.3f}, {heatmap.max():.3f}]")
-    print(f"Saved overlay -> {out_path.resolve()}")
+    print("\nComputing Grad-CAM for Custom 2D CNN...")
+    try:
+        heatmap_cnn, overlay_cnn, label_cnn, conf_cnn = compute_gradcam(img_path, model_type="cnn")
+        out_path_cnn = Path("gradcam_output_cnn.png")
+        Image.fromarray(overlay_cnn).save(out_path_cnn)
+        print(f"  Prediction: {label_cnn} ({conf_cnn:.3f})")
+        print(f"  Saved overlay -> {out_path_cnn.resolve()}")
+    except Exception as e:
+        print(f"  Error: {e}")
+
