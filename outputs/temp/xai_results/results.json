@@ -1,0 +1,1 @@
+{"resnet50": {"pred_class": "anomalous", "confidence": 0.942048966884613, "latency": 258.1651210784912}, "cnn": {"pred_class": "anomalous", "confidence": 0.8096729516983032, "latency": 13.940811157226562}}

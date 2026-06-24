@@ -17,18 +17,10 @@ venv.bak/
 # macOS
 .DS_Store
 
-# Machine Learning & Data
-data/
-outputs/
-checkpoints/
-*.pt
-*.pth
-*.h5
-
-# Output images
-*.png
-*.jpg
-*.jpeg
+# Output images (uncomment if you want to ignore them later)
+# *.png
+# *.jpg
+# *.jpeg
 
 # Jupyter Notebook
 .ipynb_checkpoints

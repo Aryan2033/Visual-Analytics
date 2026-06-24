@@ -1,0 +1,9 @@
+Samples: 83
+Accuracy: 0.9759
+Precision: 0.9841
+Recall: 0.9841
+F1: 0.9841
+ROC AUC: 0.9889
+Confusion matrix:
+[[19  1]
+ [ 1 62]]
