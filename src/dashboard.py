@@ -1,29 +1,33 @@
 """
 Streamlit Dashboard for MVTec XAI Anomaly Detection.
 
-Flow:
-  1. User uploads a bottle image (or picks a sample).
-  2. Both models (ResNet-50 + Custom 2D CNN) predict normal vs anomalous.
-  3. Grad-CAM and LIME explain WHY each model made its decision.
-  4. Everything is shown side-by-side on a single page.
+This dashboard does ZERO heavy ML computation itself.
+All predictions, Grad-CAM, and LIME are computed in a subprocess
+(compute_xai.py) to avoid Python 3.13 + loky segfaults on macOS.
+The dashboard only loads and displays saved images/results.
 """
 
+import os
 import sys
+import json
+import subprocess
 from pathlib import Path
 
-# Add src/ directory to system path to allow absolute imports
-sys.path.append(str(Path(__file__).resolve().parent))
+SRC_DIR = Path(__file__).resolve().parent
+sys.path.append(str(SRC_DIR))
 
 import cv2
-import time
 import numpy as np
 import streamlit as st
 from PIL import Image
 
 from config import DATA_DIR, CHECKPOINTS_DIR, IMAGE_SIZE
-from predict import predict_image, CLASS_NAMES
-from gradcam_explain import compute_gradcam
-from lime_explain import compute_lime
+
+# Path to the python interpreter and XAI computation script
+PYTHON = sys.executable
+COMPUTE_SCRIPT = str(SRC_DIR / "compute_xai.py")
+TEMP_DIR = Path("outputs/temp")
+XAI_OUTPUT_DIR = TEMP_DIR / "xai_results"
 
 
 # ---------------------------------------------------------------------------
@@ -37,37 +41,24 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Custom CSS for a polished look
+# Custom CSS
 # ---------------------------------------------------------------------------
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-
-    /* Global */
     html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
-    /* Header banner */
     .hero-title {
-        font-size: 2.2rem;
+        font-size: 1.8rem;
         font-weight: 800;
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
-        margin-bottom: 0;
+        margin-bottom: 0; padding-bottom: 0;
     }
-    .hero-subtitle {
-        font-size: 1rem;
-        color: #6c757d;
-        margin-top: 0;
-    }
-
-    /* Prediction cards */
     .pred-card {
-        border-radius: 12px;
-        padding: 24px;
-        text-align: center;
-        border: 2px solid #e9ecef;
-        margin-bottom: 16px;
+        border-radius: 8px; padding: 12px;
+        text-align: center; border: 2px solid #e9ecef; margin-bottom: 8px;
     }
     .pred-card-normal {
         background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%);
@@ -77,55 +68,12 @@ st.markdown("""
         background: linear-gradient(135deg, #f8d7da 0%, #f5c6cb 100%);
         border-color: #dc3545;
     }
-    .pred-label {
-        font-size: 13px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-        color: #6c757d;
-        margin-bottom: 8px;
-    }
-    .pred-result {
-        font-size: 1.6rem;
-        font-weight: 800;
-    }
+    .pred-label { font-size: 14px; font-weight: 700; color: #343a40; margin-bottom: 4px; }
+    .pred-result { font-size: 1.4rem; font-weight: 800; }
     .pred-result-normal { color: #155724; }
     .pred-result-anomalous { color: #721c24; }
-    .pred-conf {
-        font-size: 2rem;
-        font-weight: 700;
-        margin: 4px 0;
-    }
-    .pred-conf-normal { color: #28a745; }
-    .pred-conf-anomalous { color: #dc3545; }
-    .pred-meta {
-        font-size: 12px;
-        color: #888;
-        margin-top: 6px;
-    }
-
-    /* Section headers */
-    .section-header {
-        font-size: 1.3rem;
-        font-weight: 700;
-        color: #343a40;
-        margin-top: 12px;
-        margin-bottom: 4px;
-        padding-bottom: 8px;
-        border-bottom: 3px solid #667eea;
-        display: inline-block;
-    }
-
-    /* Explanation text */
-    .explain-text {
-        background: #f0f2f6;
-        border-left: 4px solid #667eea;
-        padding: 12px 16px;
-        border-radius: 0 8px 8px 0;
-        font-size: 14px;
-        color: #495057;
-        margin-bottom: 12px;
-    }
+    .pred-meta { font-size: 11px; color: #666; margin-top: 2px; }
+    .streamlit-expanderHeader { font-size: 14px; font-weight: 600; padding: 8px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -134,51 +82,63 @@ st.markdown("""
 # Helpers
 # ---------------------------------------------------------------------------
 def save_uploaded_file(uploaded_file) -> Path:
-    temp_dir = Path("outputs/temp")
-    temp_dir.mkdir(exist_ok=True, parents=True)
-    temp_path = temp_dir / uploaded_file.name
+    TEMP_DIR.mkdir(exist_ok=True, parents=True)
+    temp_path = TEMP_DIR / uploaded_file.name
     with open(temp_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
     return temp_path
 
 
-def get_thresholded_gradcam_overlay(image_path: Path, heatmap: np.ndarray, threshold_pct: int) -> np.ndarray:
+def get_thresholded_overlay(image_path: Path, heatmap: np.ndarray, threshold_pct: int) -> np.ndarray:
     pil_image = Image.open(image_path).convert("RGB").resize((IMAGE_SIZE, IMAGE_SIZE))
     img_np = np.array(pil_image)
     thr = np.percentile(heatmap, threshold_pct)
     binary_mask = (heatmap >= thr).astype(np.uint8)
     mask_overlay = img_np.copy()
     mask_overlay[binary_mask == 1] = [230, 57, 70]
-    alpha = 0.45
-    blended = cv2.addWeighted(mask_overlay, alpha, img_np, 1 - alpha, 0)
+    blended = cv2.addWeighted(mask_overlay, 0.45, img_np, 0.55, 0)
     return blended
 
 
-@st.cache_data
-def run_cached_gradcam(_image_path_str: str, model_type: str):
-    return compute_gradcam(Path(_image_path_str), model_type=model_type)
+def run_xai_pipeline(image_path: Path, gradcam_threshold: int, lime_samples: int, lime_features: int):
+    """Run ALL XAI computations in a subprocess. Returns results dict."""
+    XAI_OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
+    result = subprocess.run(
+        [PYTHON, COMPUTE_SCRIPT,
+         str(image_path),
+         str(gradcam_threshold),
+         str(lime_samples),
+         str(lime_features),
+         str(XAI_OUTPUT_DIR)],
+        capture_output=True,
+        text=True,
+        cwd=str(SRC_DIR.parent),
+        timeout=120,
+    )
 
-@st.cache_data
-def run_cached_lime(_image_path_str: str, num_samples: int, num_features: int, model_type: str):
-    return compute_lime(Path(_image_path_str), num_samples=num_samples, num_features=num_features, model_type=model_type)
+    results_file = XAI_OUTPUT_DIR / "results.json"
+    if not results_file.exists():
+        raise RuntimeError(f"XAI computation failed.\nstderr: {result.stderr}\nstdout: {result.stdout}")
+
+    with open(results_file) as f:
+        return json.load(f)
 
 
 # ---------------------------------------------------------------------------
 # HEADER
 # ---------------------------------------------------------------------------
-st.markdown("<p class='hero-title'>🔍 MVTec XAI — Anomaly Detection</p>", unsafe_allow_html=True)
-st.markdown("<p class='hero-subtitle'>Upload a bottle image → Both models predict Normal or Anomalous → See <b>why</b> with Grad-CAM & LIME explanations</p>", unsafe_allow_html=True)
+st.markdown("<p class='hero-title'>🔍 MVTec XAI — Explainable Anomaly Detection</p>", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# SIDEBAR — Image Input + XAI Controls
+# SIDEBAR
 # ---------------------------------------------------------------------------
 st.sidebar.markdown("## 📷 Image Input")
-input_mode = st.sidebar.radio("Choose source:", ["Upload Image", "Pick from Test Set"], label_visibility="collapsed")
+input_mode = st.sidebar.radio("Choose source:", ["Pick from Test Set", "Upload Image"], label_visibility="collapsed")
 image_path = None
 
 if input_mode == "Upload Image":
-    uploaded_file = st.sidebar.file_uploader("Upload a bottle image (PNG/JPG)", type=["png", "jpg", "jpeg"])
+    uploaded_file = st.sidebar.file_uploader("Upload a bottle image", type=["png", "jpg", "jpeg"])
     if uploaded_file is not None:
         image_path = save_uploaded_file(uploaded_file)
 else:
@@ -194,185 +154,118 @@ else:
         st.sidebar.error("Dataset not found under data/bottle/test/")
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("## ⚙️ Explainability Settings")
-gradcam_threshold = st.sidebar.slider("Grad-CAM Highlight Percentile", 50, 95, 75, step=5,
-                                       help="Higher = stricter focus on hottest regions")
-lime_samples = st.sidebar.slider("LIME Perturbations", 200, 1000, 500, step=100,
-                                  help="More samples = more accurate but slower")
-lime_features = st.sidebar.slider("LIME Top Superpixels", 1, 10, 4,
-                                   help="Number of important regions to highlight")
+st.sidebar.markdown("## ⚙️ XAI Settings")
+gradcam_threshold = st.sidebar.slider("Grad-CAM Threshold (%)", 50, 95, 75, step=5)
+lime_samples = st.sidebar.slider("LIME Perturbations", 200, 1000, 500, step=100)
+lime_features = st.sidebar.slider("LIME Top Superpixels", 1, 10, 4)
 
 # ---------------------------------------------------------------------------
 # MAIN CONTENT
 # ---------------------------------------------------------------------------
 if image_path is None:
-    st.markdown("---")
-    st.info("👈 **Upload a bottle image** or **pick one from the test set** in the sidebar to get started.")
-    st.markdown("""
-    ### How it works
-    1. **Upload** a bottle image (normal or defective)
-    2. **Both models** (ResNet-50 & Custom 2D CNN) will classify it
-    3. **Grad-CAM** shows *where* the model looked (heatmap)
-    4. **LIME** shows *which regions* influenced the decision (superpixels)
-    """)
+    st.info("👈 **Select an image** in the sidebar to run the pipeline.")
 else:
-    # =======================================================================
-    # SECTION 1: Input Image Preview
-    # =======================================================================
-    col_preview, col_spacer, col_info = st.columns([1.5, 0.2, 3])
+    # Run ALL computations in a subprocess
+    with st.spinner("⏳ Running both models + Grad-CAM + LIME... (this takes ~15 seconds)"):
+        try:
+            results = run_xai_pipeline(image_path, gradcam_threshold, lime_samples, lime_features)
+        except Exception as e:
+            st.error(f"❌ Pipeline failed: {e}")
+            st.stop()
 
-    with col_preview:
-        st.image(str(image_path), use_container_width=True)
+    # ==========================================
+    # 3-Column Layout: [Input] [ResNet-50] [CNN]
+    # ==========================================
+    col_input, col_resnet, col_cnn = st.columns([1, 1.5, 1.5], gap="large")
 
-    with col_info:
-        st.markdown(f"**File:** `{image_path.name}`")
+    # COLUMN 1: Input Image
+    with col_input:
+        st.image(str(image_path), width="stretch", caption="Input Image")
         if input_mode == "Pick from Test Set":
             if selected_category == "good":
-                st.success("📋 **Ground Truth:** Normal (good)")
+                st.success("📋 **Truth:** Normal")
             else:
-                st.error(f"📋 **Ground Truth:** Anomalous — *{selected_category}*")
-        else:
-            st.info("📋 Uploaded image — ground truth unknown")
+                st.error(f"📋 **Truth:** Anomalous ({selected_category})")
 
-    st.markdown("---")
-
-    # =======================================================================
-    # SECTION 2: Both Models' Predictions — Side by Side
-    # =======================================================================
-    st.markdown("<p class='section-header'>📊 Model Predictions</p>", unsafe_allow_html=True)
-
-    col_resnet, col_cnn = st.columns(2)
-
-    predictions = {}
-    for col, m_type, m_name in [
+    # COLUMNS 2 & 3: Model Results
+    models_config = [
         (col_resnet, "resnet50", "ResNet-50 (Transfer Learning)"),
         (col_cnn, "cnn", "Custom 2D CNN (From Scratch)")
-    ]:
+    ]
+
+    for col, m_type, m_name in models_config:
         with col:
-            start_time = time.time()
-            try:
-                pred_class, confidence = predict_image(image_path, model_type=m_type)
-                latency = (time.time() - start_time) * 1000
-                predictions[m_type] = (pred_class, confidence, latency)
+            r = results[m_type]
+            pred_class = r["pred_class"]
+            confidence = r["confidence"]
+            latency = r["latency"]
 
-                is_anomalous = pred_class == "anomalous"
-                card_class = "pred-card-anomalous" if is_anomalous else "pred-card-normal"
-                result_class = "pred-result-anomalous" if is_anomalous else "pred-result-normal"
-                conf_class = "pred-conf-anomalous" if is_anomalous else "pred-conf-normal"
-                icon = "🚨" if is_anomalous else "✅"
+            # --- Prediction Card ---
+            is_anomalous = pred_class == "anomalous"
+            card_class = "pred-card-anomalous" if is_anomalous else "pred-card-normal"
+            result_class = "pred-result-anomalous" if is_anomalous else "pred-result-normal"
+            icon = "🚨" if is_anomalous else "✅"
 
-                st.markdown(f"""
-                <div class='pred-card {card_class}'>
-                    <div class='pred-label'>{m_name}</div>
-                    <div class='pred-result {result_class}'>{icon} {pred_class.upper()}</div>
-                    <div class='pred-conf {conf_class}'>{confidence:.1%}</div>
-                    <div class='pred-meta'>confidence · {latency:.0f}ms latency</div>
-                </div>
-                """, unsafe_allow_html=True)
-            except Exception as e:
-                st.error(f"❌ {m_name}: {e}")
+            st.markdown(f"""
+            <div class='pred-card {card_class}'>
+                <div class='pred-label'>{m_name}</div>
+                <div class='pred-result {result_class}'>{icon} {pred_class.upper()} ({confidence:.1%})</div>
+                <div class='pred-meta'>{latency:.0f}ms latency</div>
+            </div>
+            """, unsafe_allow_html=True)
 
-    st.markdown("---")
+            # --- Grad-CAM Expander ---
+            with st.expander("📍 Grad-CAM Explanation (Gradients)", expanded=True):
+                gradcam_path = XAI_OUTPUT_DIR / f"gradcam_{m_type}.png"
+                heatmap_path = XAI_OUTPUT_DIR / f"heatmap_{m_type}.npy"
 
-    # =======================================================================
-    # SECTION 3: WHY is it anomalous? — Grad-CAM Explanations
-    # =======================================================================
-    st.markdown("<p class='section-header'>📍 Why this prediction? — Grad-CAM</p>", unsafe_allow_html=True)
-    st.markdown("""<div class='explain-text'>
-        <b>Grad-CAM</b> looks <i>inside</i> the model to find which spatial regions of the image
-        most strongly activated the predicted class. Red/warm areas = high importance.
-    </div>""", unsafe_allow_html=True)
+                if gradcam_path.exists() and heatmap_path.exists():
+                    overlay = np.array(Image.open(gradcam_path))
+                    heatmap = np.load(heatmap_path)
+                    thresholded = get_thresholded_overlay(image_path, heatmap, gradcam_threshold)
 
-    col_gc_resnet, col_gc_cnn = st.columns(2)
-    image_path_str = str(image_path)
+                    gc1, gc2 = st.columns(2)
+                    with gc1:
+                        st.image(overlay, width="stretch", caption="Overlay")
+                    with gc2:
+                        st.image(thresholded, width="stretch", caption=f"Top {100-gradcam_threshold}% Focus")
+                else:
+                    st.error("Grad-CAM output not found.")
 
-    for col, m_type, m_name in [
-        (col_gc_resnet, "resnet50", "ResNet-50"),
-        (col_gc_cnn, "cnn", "Custom 2D CNN")
-    ]:
-        with col:
-            if m_type not in predictions:
-                continue
-            st.markdown(f"**{m_name}**")
-            with st.spinner(f"Computing Grad-CAM for {m_name}..."):
-                try:
-                    heatmap, overlay, _, _ = run_cached_gradcam(image_path_str, model_type=m_type)
-                    thresholded = get_thresholded_gradcam_overlay(image_path, heatmap, gradcam_threshold)
-
-                    sub1, sub2 = st.columns(2)
-                    with sub1:
-                        st.image(overlay, use_container_width=True, caption="Heatmap Overlay")
-                    with sub2:
-                        st.image(thresholded, use_container_width=True, caption=f"Top {100-gradcam_threshold}% Focus")
-                except Exception as e:
-                    st.error(f"Grad-CAM error: {e}")
-
-    st.markdown("---")
+            # --- LIME Expander ---
+            with st.expander("🧩 LIME Explanation (Perturbation)", expanded=False):
+                lime_path = XAI_OUTPUT_DIR / f"lime_{m_type}.png"
+                if lime_path.exists():
+                    lime_img = np.array(Image.open(lime_path))
+                    st.image(lime_img, width="stretch",
+                             caption=f"Top {lime_features} important regions")
+                else:
+                    st.error("LIME output not found.")
 
     # =======================================================================
-    # SECTION 4: WHY is it anomalous? — LIME Explanations
+    # BOTTOM: Model Comparison Table
     # =======================================================================
-    st.markdown("<p class='section-header'>🧩 Why this prediction? — LIME</p>", unsafe_allow_html=True)
-    st.markdown(f"""<div class='explain-text'>
-        <b>LIME</b> treats the model as a black box. It hides parts of the image ({lime_samples}× perturbations)
-        and watches how the prediction changes, revealing which regions matter most. Yellow boundaries = important superpixels.
-    </div>""", unsafe_allow_html=True)
-
-    col_lime_resnet, col_lime_cnn = st.columns(2)
-
-    for col, m_type, m_name in [
-        (col_lime_resnet, "resnet50", "ResNet-50"),
-        (col_lime_cnn, "cnn", "Custom 2D CNN")
-    ]:
-        with col:
-            if m_type not in predictions:
-                continue
-            st.markdown(f"**{m_name}**")
-            with st.spinner(f"Running LIME for {m_name} ({lime_samples} perturbations)..."):
-                try:
-                    _, lime_overlay, _, _ = run_cached_lime(
-                        image_path_str,
-                        num_samples=lime_samples,
-                        num_features=lime_features,
-                        model_type=m_type
-                    )
-                    st.image(lime_overlay, use_container_width=True,
-                             caption=f"Top {lime_features} important superpixels")
-                except Exception as e:
-                    st.error(f"LIME error: {e}")
-
-    st.markdown("---")
-
-    # =======================================================================
-    # SECTION 5: Model Comparison Table
-    # =======================================================================
-    st.markdown("<p class='section-header'>📈 Model Comparison</p>", unsafe_allow_html=True)
-
-    # Load CNN val accuracy from checkpoint
-    cnn_val_acc = "75.60%"
-    try:
+    with st.expander("📈 View Model Metrics & Comparison", expanded=False):
         import torch
-        cnn_ckpt = CHECKPOINTS_DIR / "best_model_cnn.pt"
-        if cnn_ckpt.exists():
-            payload = torch.load(cnn_ckpt, map_location="cpu", weights_only=False)
-            val_acc = payload.get("val_acc", None)
-            if val_acc:
-                cnn_val_acc = f"{val_acc:.2%}"
-    except Exception:
-        pass
+        cnn_val_acc = "75.60%"
+        try:
+            cnn_ckpt = CHECKPOINTS_DIR / "best_model_cnn.pt"
+            if cnn_ckpt.exists():
+                payload = torch.load(cnn_ckpt, map_location="cpu", weights_only=False)
+                val_acc = payload.get("val_acc", None)
+                if val_acc:
+                    cnn_val_acc = f"{val_acc:.2%}"
+        except Exception:
+            pass
 
-    resnet_latency = f"{predictions['resnet50'][2]:.0f} ms" if 'resnet50' in predictions else "—"
-    cnn_latency = f"{predictions['cnn'][2]:.0f} ms" if 'cnn' in predictions else "—"
+        resnet_r = results.get("resnet50", {})
+        cnn_r = results.get("cnn", {})
 
-    comparison_data = {
-        "": ["Parameters", "Backbone", "Validation Accuracy", "Inference Latency"],
-        "ResNet-50": ["23,512,130", "ImageNet V2 (pretrained)", "97.59%", resnet_latency],
-        "Custom 2D CNN": ["106,306", "None (from scratch)", cnn_val_acc, cnn_latency],
-    }
-    st.table(comparison_data)
-
-    # =======================================================================
-    # FOOTER
-    # =======================================================================
-    st.markdown("---")
-    st.caption("MVTec XAI — Visual Analytics Project, Summer 2026 · ResNet-50 (Transfer Learning) vs Custom 2D CNN (Scratch)")
+        comparison_data = {
+            "Metric": ["Parameters", "Backbone", "Validation Accuracy", "Inference Latency"],
+            "ResNet-50": ["23,512,130", "ImageNet V2 (pretrained)", "97.59%",
+                          f"{resnet_r.get('latency', 0):.0f} ms"],
+            "Custom 2D CNN": ["106,306", "None (from scratch)", cnn_val_acc,
+                              f"{cnn_r.get('latency', 0):.0f} ms"],
+        }
+        st.table(comparison_data)

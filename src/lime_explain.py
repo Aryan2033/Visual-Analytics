@@ -34,27 +34,46 @@ from predict import CLASS_NAMES, get_model
 
 # LIME calls our model many times, so we need a "batch predict" function
 # that takes a numpy batch of images and returns class probabilities.
+#
+# IMPORTANT: We create a CPU copy of the model rather than moving the
+# cached model between MPS and CPU, which causes segfaults on macOS
+# Apple Silicon due to MPS memory corruption.
+import copy
+
+_LIME_CPU_MODELS = {}
+
+def _get_cpu_model(model_type: str):
+    """Return a CPU-only copy of the model for LIME (avoids MPS segfault)."""
+    global _LIME_CPU_MODELS
+    if model_type not in _LIME_CPU_MODELS:
+        original = get_model(model_type)
+        cpu_copy = copy.deepcopy(original).to("cpu")
+        cpu_copy.eval()
+        _LIME_CPU_MODELS[model_type] = cpu_copy
+    return _LIME_CPU_MODELS[model_type]
+
+
 def _batch_predict(images_np: np.ndarray, model_type: str = "resnet50") -> np.ndarray:
     """
     images_np: (N, H, W, 3) uint8 or float [0..1] numpy array
     returns:   (N, num_classes) numpy array of probabilities
     """
-    model = get_model(model_type)
+    model = _get_cpu_model(model_type)
 
     # Convert to a torch tensor of shape (N, 3, H, W) and normalize the same
     # way our training transforms did, otherwise the model gets confused.
     if images_np.dtype == np.uint8:
         images_np = images_np.astype(np.float32) / 255.0
 
-    tensor = torch.from_numpy(images_np).permute(0, 3, 1, 2).to(DEVICE)
-    mean = torch.tensor(IMAGENET_MEAN, device=DEVICE).view(1, 3, 1, 1)
-    std  = torch.tensor(IMAGENET_STD,  device=DEVICE).view(1, 3, 1, 1)
+    tensor = torch.from_numpy(images_np).permute(0, 3, 1, 2).to("cpu")
+    mean = torch.tensor(IMAGENET_MEAN, device="cpu").view(1, 3, 1, 1)
+    std  = torch.tensor(IMAGENET_STD,  device="cpu").view(1, 3, 1, 1)
     tensor = (tensor - mean) / std
 
     with torch.no_grad():
         logits = model(tensor)
         probs  = F.softmax(logits, dim=1)
-    return probs.cpu().numpy()
+    return probs.numpy()
 
 
 def compute_lime(image_path: Path, num_samples: int = 1000, num_features: int = 5, model_type: str = "resnet50") -> Tuple[np.ndarray, np.ndarray, str, float]:
